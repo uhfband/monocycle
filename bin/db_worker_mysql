@@ -1,0 +1,115 @@
+#!/usr/bin/env php
+<?php
+
+/**
+ * MySQL worker daemon.
+ *
+ * Usage: db_worker_mysql.php <socket_path> <database_name> [init_sql_path]
+ *
+ * Connection settings are read from the environment rather than the command
+ * line, so the password doesn't show up in the process list:
+ *   MYSQL_HOST    (default "localhost")
+ *   MYSQL_PORT    (default 3306)
+ *   MYSQL_SOCKET  (server unix socket, used when MYSQL_HOST is "localhost")
+ *   MYSQL_USER
+ *   MYSQL_PWD
+ *
+ * Listens on a local unix socket and executes queries received in
+ * Uhf\Monocycle\Database\Protocol packets, sending back one response
+ * packet per request. If the database doesn't exist it is created and,
+ * when given, the init SQL script is executed on it.
+ *
+ * A lost server connection fails the request that hit it and is
+ * re-established on the next one. Session state (open transactions, user
+ * variables, temporary tables) does not survive a reconnect.
+ */
+
+use Monolog\Handler\StreamHandler;
+use Monolog\Handler\WhatFailureGroupHandler;
+use Monolog\Logger;
+use Uhf\Monocycle\Database\MySQL\Driver;
+use Uhf\Monocycle\Database\Server;
+use Uhf\Monocycle\Monocycle;
+use Uhf\Monocycle\Pipe\Pipe;
+use Uhf\Monocycle\Timer\Timer;
+
+// $_composer_autoload_path is only set when run via Composer's vendor/bin proxy;
+// MySQL\Connection::open() runs this file directly, so probe both the
+// standalone checkout and the installed-as-dependency (vendor/uhf/monocycle) layouts
+include $_composer_autoload_path ?? (function (): string {
+    foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $file) {
+        if (is_file($file)) {
+            return $file;
+        }
+    }
+    fwrite(STDERR, "Composer autoloader not found\n");
+    exit(1);
+})();
+
+set_time_limit(0);
+ini_set('display_errors', 1);
+
+if ($argc < 3 || $argc > 4) {
+    fwrite(STDERR, sprintf("Usage: %s <socket_path> <database_name> [init_sql_path]\n", $argv[0]));
+    exit(1);
+}
+
+[, $socketPath, $dbName] = $argv;
+$initSqlPath = $argv[3] ?? null;
+
+// STDOUT is a pipe to the parent, which doesn't read it, and once the parent
+// is gone writing there fails with EPIPE and makes Monolog throw. Log to the
+// inherited STDERR instead and never let a failed log write kill the worker.
+Monocycle::setLogger(new Logger('db_worker', [
+    new WhatFailureGroupHandler([new StreamHandler(STDERR, Monocycle::getLogLevel())]),
+]));
+
+if (!extension_loaded('mysqli')) {
+    fwrite(STDERR, "mysqli extension is required\n");
+    exit(1);
+}
+
+/**
+ * Seconds between pings on an idle connection, keeps it below wait_timeout
+ */
+const KEEPALIVE_INTERVAL = 60;
+
+try {
+    $driver = new Driver($dbName, $initSqlPath);
+} catch (Exception $e) {
+    fwrite(STDERR, $e->getMessage() . "\n");
+    exit(1);
+}
+
+$server = new Server('unix://' . $socketPath, $driver);
+
+$keepAlive = new Timer(function () use ($driver) {
+    $driver->ping();
+});
+$keepAlive->setInterval(KEEPALIVE_INTERVAL)
+        ->start();
+
+if (function_exists('pcntl_async_signals')) {
+    pcntl_async_signals(true);
+    $onSignal = function () {
+        Monocycle::stop();
+    };
+    pcntl_signal(SIGINT, $onSignal);
+    pcntl_signal(SIGTERM, $onSignal);
+}
+
+// When started by MySQL\Connection::open(), STDIN is a pipe whose write
+// end is held by the parent. The parent never writes to it, so EOF means the
+// parent has exited (including crashes and SIGKILL) and the worker must too.
+$stdinStat = fstat(STDIN);
+if ($stdinStat !== false && ($stdinStat['mode'] & 0170000) === 0010000) {
+    $stdin = new Pipe(STDIN,Pipe::MODE_WRITE);
+    $stdin->onEnd = $stdin->onError = function () {
+        Monocycle::getLogger()->info('Parent process is gone, exiting');
+        Monocycle::stop();
+    };
+}
+
+Monocycle::getLogger()->info("Listening on $socketPath, database $dbName");
+
+Monocycle::run();

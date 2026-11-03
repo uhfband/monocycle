@@ -1,0 +1,29 @@
+#!/usr/bin/env php
+<?php
+
+use Uhf\Monocycle\Monocycle;
+use Uhf\Monocycle\Proto\Http\Server\Server as HttpServer;
+
+// $_composer_autoload_path is only set when run via Composer's vendor/bin proxy;
+// it can also be run directly (e.g. ./bin/http_server from a checkout), so probe both the
+// standalone checkout and the installed-as-dependency (vendor/uhf/monocycle) layouts
+include $_composer_autoload_path ?? (function (): string {
+    foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $file) {
+        if (is_file($file)) {
+            return $file;
+        }
+    }
+    fwrite(STDERR, "Composer autoloader not found\n");
+    exit(1);
+})();
+
+set_time_limit(0);
+ini_set('display_errors', 1);
+
+$port = getenv('HTTP_PORT') ?: 80;
+$host = getenv('HTTP_HOST') ?: '0.0.0.0';
+$wwwRoot = getenv('WWW_ROOT') ?: '/var/www/html';
+
+$server = new HttpServer(sprintf("tcp://%s:%d", $host, $port), $wwwRoot);
+
+Monocycle::run();
