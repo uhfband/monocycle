@@ -54,6 +54,11 @@ class Pipe extends Stream
         return !is_resource($this->getResource()) || feof($this->getResource());
     }
 
+    /**
+     * @param string $data
+     * @return void
+     * @throws StreamException
+     */
     public function write(string $data): void
     {
         if (!strlen($data)) {

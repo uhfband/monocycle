@@ -35,7 +35,7 @@ class Timer
     public function setDelay(int $delay): self
     {
         $this->delay = $delay;
-        $this->nextRunTimestamp = time() + $delay;
+        $this->nextRunTimestamp = $this->now() + $delay;
 
         return $this;
     }
@@ -43,7 +43,7 @@ class Timer
     public function setInterval(int $interval): self
     {
         $this->interval = $interval;
-        $this->nextRunTimestamp = time() + $interval;
+        $this->nextRunTimestamp = $this->now() + $interval;
 
         return $this;
     }
@@ -72,17 +72,17 @@ class Timer
 
     public function start(): self
     {
-        if ($this->running) {
-            throw new TimerException('Timer is already running.');
-        }
         if (empty($this->nextRunTimestamp)) {
             throw new TimerException('Timer is not set');
         }
-        $this->running = true;
 
-        $this->reset();
+        if (!$this->running) {
+            $this->running = true;
 
-        Monocycle::addTimer($this);
+            $this->reset();
+
+            Monocycle::addTimer($this);
+        }
 
         return $this;
     }
@@ -90,9 +90,9 @@ class Timer
     public function reset(): self
     {
         if (!empty($this->delay)) {
-            $this->nextRunTimestamp = time() + $this->delay;
+            $this->nextRunTimestamp = $this->now() + $this->delay;
         } elseif(!empty($this->interval)) {
-            $this->nextRunTimestamp = time() + $this->interval;
+            $this->nextRunTimestamp = $this->now() + $this->interval;
         }
 
         return $this;
@@ -133,5 +133,10 @@ class Timer
         } else {
             $this->stop();
         }
+    }
+
+    private function now(): int
+    {
+        return time();
     }
 }

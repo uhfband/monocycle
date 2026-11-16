@@ -2,15 +2,15 @@
 
 namespace Uhf\Monocycle\Process;
 
-use Psr\Log\LoggerInterface;
 use Psr\Log\LogLevel;
+use Psr\Log\LoggerInterface;
 use Uhf\Monocycle\Monocycle;
 use Uhf\Monocycle\Pipe\Pipe;
-use Uhf\Monocycle\Process\ProcessException as ProcessException;
+use Uhf\Monocycle\Stream\StreamException;
+use Uhf\Monocycle\Timer\Timer;
 
 class Process
 {
-    //0 is stdin, 1 is stdout, while 2 is stderr.
     public const STDIN = 0;
     public const STDOUT = 1;
     public const STDERR = 2;
@@ -89,10 +89,11 @@ class Process
     {
         $this->process = proc_open($this->cmd, $this->descriptorSpec, $this->streams, null, $this->env);
 
-        if (!is_resource($this->process)) {
+        if ($this->process === false) {
             throw new ProcessException('Create process error');
         }
         $this->pid = proc_get_status($this->process)['pid'];
+        $this->loggerContext['pid'] = $this->pid;
 
         foreach ($this->descriptorSpec as $pipeNum => $desc) {
             if (!is_array($desc)) {
@@ -151,9 +152,7 @@ class Process
                     join(' ', $this->cmd),
                     json_encode($this->descriptorSpec)
                 ),
-                array_merge($this->loggerContext, [
-                    'pid' => $this->pid,
-                ])
+                $this->loggerContext
             );
         }
 
@@ -170,6 +169,7 @@ class Process
      * @param int $pipeNum
      * @return void
      * @throws ProcessException
+     * @throws StreamException
      */
     public function write(string $data, int $pipeNum = 0)
     {
@@ -217,11 +217,7 @@ class Process
             return false;
         }
 
-        //$status = explode(' ', file_get_contents("/proc/{$this->pid}/stat"));
-        //return $status[2] !== 'Z';
-
         $status = proc_get_status($this->process);
-        //print_r($status);
 
         if (!$status['running'] && is_null($this->exitCode)) {
             // exitcode is only meaningful when the process exited on its own;
@@ -233,9 +229,9 @@ class Process
         return $status['running'];
     }
 
-    public function interrupt(): void
+    public function interrupt(int $timeout = null): void
     {
-        $this->terminate(self::SIGINT);
+        $this->terminate(self::SIGINT, $timeout);
     }
 
     public function kill(): void
@@ -243,10 +239,18 @@ class Process
         $this->terminate(self::SIGKILL);
     }
 
-    public function terminate(int $signal = self::SIGTERM): void
+    public function terminate(int $signal = self::SIGTERM, int $timeout = null): void
     {
         if (is_resource($this->process)) {
             proc_terminate($this->process, $signal);
+            if ($timeout !== null && $signal !== self::SIGKILL) {
+                $timer = new Timer(function () {
+                    if (is_resource($this->process)) {
+                        proc_terminate($this->process, self::SIGKILL);
+                    }
+                });
+                $timer->setDelay($timeout)->start();
+            }
         }
     }
 
@@ -304,9 +308,7 @@ class Process
             $this->logger->log(
                 (!$code) ? LogLevel::INFO : LogLevel::WARNING,
                 'Process exited with code ' . $code,
-                array_merge($this->loggerContext, [
-                    'pid' => $this->pid,
-                ])
+                $this->loggerContext
             );
         }
     }

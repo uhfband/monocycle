@@ -113,27 +113,6 @@ namespace {
         $this->assertSame(0, $this->countMonocycle('timers'));
     }
 
-    public function testStartWhenAlreadyRunningThrowsException(): void
-    {
-        $timer = new Timer(static function () {
-        });
-        $timer->setDelay(5)->start();
-
-        \Uhf\Monocycle\Timer\setMockTime(self::MOCK_TIME + 3);
-
-        try {
-            $timer->start();
-            $this->fail('Expected exception');
-        } catch (Exception $e) {
-            $this->assertSame('Timer is already running.', $e->getMessage());
-        }
-
-        // still registered once, deadline not re-armed
-        $this->assertTrue($timer->isRunning());
-        $this->assertSame(1, $this->countMonocycle('timers'));
-        $this->assertSame(self::MOCK_TIME + 5, $timer->getNextRunTimestamp());
-    }
-
     public function testTimerCanBeStartedAgainAfterStop(): void
     {
         $timer = new Timer(static function () {

@@ -151,8 +151,7 @@ abstract class Stream
     }
 
     /**
-     * Limit of the write buffer (default 1MiB): a write that would make
-     * the buffered data reach $length bytes throws StreamException.
+     * Limit of the write buffer
      */
     public function setWriteBufferSize(int $length): void
     {
