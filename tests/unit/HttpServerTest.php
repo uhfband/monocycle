@@ -385,6 +385,6 @@ class HttpServerTest extends BaseTest
         $buffer = $state['received'];
         $responses = $this->parseResponses($buffer);
         $this->assertCount(1, $responses);
-        $this->assertSame(400, $responses[0]['status']);
+        $this->assertSame(413, $responses[0]['status']);
     }
 }

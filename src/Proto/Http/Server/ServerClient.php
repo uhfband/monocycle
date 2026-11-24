@@ -82,10 +82,10 @@ class ServerClient extends Connection
         parent::onData($data);
 
         if ($this->maxRequestLength && (strlen($this->readBuffer) + strlen($data)) > $this->maxRequestLength) {
-            $response = new Response(400, 'Bad Request');
+            $response = new Response(413, 'Payload Too Large');
             $response->setContent('Bad request');
             $this->readBuffer  = '';
-            $this->write((string)$response);
+            $this->onResponse($response);
 
             return;
         }
@@ -140,31 +140,32 @@ class ServerClient extends Connection
                 $response = new Response(200, 'OK');
                 $response->setContent($content);
             }
-            $this->onResponse($request, $response);
+            $this->onResponse($response, $request);
         });
 
         if (!is_null($response)) {
-            $this->onResponse($request, $response);
+            $this->onResponse($response, $request);
         }
     }
 
-    protected function onResponse($request, $response)
+    protected function onResponse($response, $request = null)
     {
         $this->response = $response;
-        //$this->write($this->response->getContent());
 
-        Monocycle::getLogger()
-            ->info(
-                sprintf(
-                    "[%s] \"%s %s %s\" %d %d",
-                    __CLASS__,
-                    $request->getMethod(),
-                    $request->getRequestUri(),
-                    $request->server->get('SERVER_PROTOCOL', 'HTTP/1.0'),
-                    $this->response->getStatusCode(),
-                    $this->response->getContentSize()
-                )
-            );
+        if (!empty($request)) {
+            Monocycle::getLogger()
+                ->info(
+                    sprintf(
+                        "[%s] \"%s %s %s\" %d %d",
+                        __CLASS__,
+                        $request->getMethod(),
+                        $request->getRequestUri(),
+                        $request->server->get('SERVER_PROTOCOL', 'HTTP/1.0'),
+                        $this->response->getStatusCode(),
+                        $this->response->getContentSize()
+                    )
+                );
+        }
 
         $this->write((string)$this->response);
     }
