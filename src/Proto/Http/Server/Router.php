@@ -116,7 +116,7 @@ class Router
         return $longest[1] ?? null;
     }
 
-    public function route(Request $request, callable $callback)
+    public function route(Request $request, callable $callback): ?Response
     {
         $method = $request->getMethod();
         $path = explode('?', $request->getRequestUri())[0];
@@ -124,14 +124,18 @@ class Router
         if ($handler = $this->match($method, $path, $matches)) {
             $request->attributes->set('matches', $matches);
             $content = call_user_func($handler, $request, $callback);
-            if (is_null($content)) {
-                return null;
+
+            if (is_string($content)) {
+                $response = new Response(200, 'OK');
+                $response->setContent($content);
+
+                return $response;
+            } elseif ($content instanceof Response) {
+
+                return $content;
             }
 
-            $response = new Response(200, 'OK');
-            $response->setContent($content);
-
-            return $response;
+            return null;
         }
 
         $uri = str_replace('..', '', $request->getRequestUri()); //sanity

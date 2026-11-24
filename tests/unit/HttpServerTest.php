@@ -2,6 +2,7 @@
 
 use Symfony\Component\HttpFoundation\Request;
 use Uhf\Monocycle\Proto\Http\Server\Server as HttpServer;
+use Uhf\Monocycle\Proto\Http\Server\Response;
 use Uhf\Monocycle\Socket\Connection;
 use Uhf\Monocycle\Socket\Socket;
 
@@ -279,7 +280,9 @@ class HttpServerTest extends BaseTest
         $this->tick(0.1);
         $this->assertSame('', $state['received']);
 
-        $respond('done');
+        $response = new Response(200, 'OK');
+        $response->setContent('done');
+        $respond($response);
 
         $this->pumpUntil(function () use ($state) {
             return $state['disconnected'];

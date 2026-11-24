@@ -83,9 +83,10 @@ class ServerClient extends Connection
 
         if ($this->maxRequestLength && (strlen($this->readBuffer) + strlen($data)) > $this->maxRequestLength) {
             $response = new Response(413, 'Payload Too Large');
-            $response->setContent('Bad request');
+            $response->setContent('Payload Too Large');
             $this->readBuffer  = '';
             $this->onResponse($response);
+            $this->close();
 
             return;
         }
@@ -135,11 +136,6 @@ class ServerClient extends Connection
 
         /////////////////////////////
         $response = $this->router->route($request, function($response) use ($request) {
-            if (is_string($response)) {
-                $content = $response;
-                $response = new Response(200, 'OK');
-                $response->setContent($content);
-            }
             $this->onResponse($response, $request);
         });
 
