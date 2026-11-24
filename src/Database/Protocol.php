@@ -10,7 +10,10 @@ use JsonException;
  * Every packet is a 32-bit unsigned big-endian payload length followed by
  * a JSON object payload of that length.
  *
- * Request payload:  {"query_id": <id>, "sql": "<query>"}
+ * Request payload:  {"query_id": <id>, "sql": "<statement>", "params": [<values>] | {"<name>": <value>}}
+ * params are bound to the statement's placeholders: a JSON array binds
+ * positional ones (?), an object named ones (SQLite only); values are null,
+ * booleans, numbers or UTF-8 strings.
  * Response payload: {"query_id": <id>, "result": [<rows>], "affected_rows": <n>, "last_insert_row_id": <n>}
  *               or  {"query_id": <id>, "error": "<description>"}
  * affected_rows and last_insert_row_id are present only when available.
@@ -22,6 +25,7 @@ class Protocol
 
     public const FIELD_QUERY_ID = 'query_id';
     public const FIELD_SQL = 'sql';
+    public const FIELD_PARAMS = 'params';
     public const FIELD_RESULT = 'result';
     public const FIELD_ERROR = 'error';
     public const FIELD_AFFECTED_ROWS = 'affected_rows';
@@ -127,12 +131,51 @@ class Protocol
     /**
      * @param int|string|null $queryId
      */
-    public static function request($queryId, string $sql): string
+    public static function request($queryId, string $sql, array $params = []): string
     {
         return self::encode([
             self::FIELD_QUERY_ID => $queryId,
             self::FIELD_SQL => $sql,
+            // an empty array would encode as [] either way, (object) keeps a
+            // named map an object even when its keys look numeric
+            self::FIELD_PARAMS => self::isList($params) ? $params : (object)$params,
         ]);
+    }
+
+    /**
+     * Checks statement parameters: a list (positional) or a map with string
+     * keys (named), with null, bool, int, float or valid UTF-8 string values
+     * (JSON can't carry binary strings, they would be mangled on the way)
+     *
+     * @param mixed $params
+     * @return string|null error description, null when valid
+     */
+    public static function paramsError($params): ?string
+    {
+        if (!is_array($params)) {
+            return "Field '" . self::FIELD_PARAMS . "' must be an array or an object";
+        }
+        $named = !self::isList($params);
+        foreach ($params as $key => $value) {
+            if ($named && (!is_string($key) || $key === '')) {
+                return 'Parameters must be either all positional or all named';
+            }
+            $name = $named ? $key : $key + 1;
+            if (is_string($value)) {
+                if (!preg_match('//u', $value)) {
+                    return "Parameter $name is not a valid UTF-8 string";
+                }
+            } elseif ($value !== null && !is_bool($value) && !is_int($value) && !is_float($value)) {
+                return "Parameter $name must be null, bool, int, float or string, " . gettype($value) . ' given';
+            }
+        }
+
+        return null;
+    }
+
+    public static function isList(array $params): bool
+    {
+        return $params === [] || array_keys($params) === range(0, count($params) - 1);
     }
 
     /**
@@ -162,6 +205,7 @@ class Protocol
 
     /**
      * @param int|string|null $queryId
+     * @throws ProtocolException
      */
     public static function errorResponse($queryId, string $error): string
     {

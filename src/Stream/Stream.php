@@ -20,7 +20,7 @@ abstract class Stream
 
     protected bool $closing = false;
     protected int $readChunkLength = 128 * 1024;
-    protected int $writeBufferSize = 1024 * 1024;
+    protected int $writeBufferSize = 16 * 1024 * 1024;
 
     /** @var ?resource */
     private $resource;

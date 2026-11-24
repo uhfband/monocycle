@@ -66,34 +66,26 @@ class Driver implements IDriver
             return Protocol::errorResponse($queryId, "Field '" . Protocol::FIELD_SQL . "' must be a non-empty string");
         }
 
+        $params = $request[Protocol::FIELD_PARAMS] ?? [];
+        $paramsError = Protocol::paramsError($params);
+        if ($paramsError !== null) {
+            return Protocol::errorResponse($queryId, $paramsError);
+        }
+        if (!Protocol::isList($params)) {
+            return Protocol::errorResponse($queryId, 'Named parameters are not supported by MySQL, use ? placeholders');
+        }
+
         try {
             $db = $this->get();
-            // real_query() runs a single statement only, like SQLite3::prepare()
-            $db->real_query($sql);
-
-            $rows = [];
-            $affectedRows = null;
-            $lastInsertRowId = null;
-
-            $res = $db->store_result();
-            if ($res instanceof mysqli_result) {
-                $rows = $res->fetch_all(MYSQLI_ASSOC);
-                $res->free();
+            if ($params === []) {
+                // not every statement can be prepared (e.g. CREATE PROCEDURE),
+                // so a query without parameters runs as a plain one
+                [$rows, $affectedRows, $lastInsertRowId] = self::executeQuery($db, $sql);
             } else {
-                $affectedRows = max(0, $db->affected_rows);
-                if ($db->insert_id) {
-                    $lastInsertRowId = (int)$db->insert_id;
-                }
+                [$rows, $affectedRows, $lastInsertRowId] = self::executeStatement($db, $sql, $params);
             }
-
-            // stored procedures (CALL) return an extra status result, and any
-            // result left unread would break the next query with "out of sync"
-            while ($db->more_results() && $db->next_result()) {
-                $extra = $db->store_result();
-                if ($extra instanceof mysqli_result) {
-                    $extra->free();
-                }
-            }
+        } catch (DatabaseException $e) {
+            return Protocol::errorResponse($queryId, $e->getMessage());
         } catch (mysqli_sql_exception $e) {
             $this->handleError($e);
             return Protocol::errorResponse($queryId, $e->getMessage());
@@ -103,6 +95,111 @@ class Driver implements IDriver
             return Protocol::response($queryId, $rows, $affectedRows, $lastInsertRowId);
         } catch (ProtocolException $e) {
             return Protocol::errorResponse($queryId, $e->getMessage());
+        }
+    }
+
+    /**
+     * @return array{0: array, 1: ?int, 2: ?int} [rows, affected rows, last insert id]
+     * @throws mysqli_sql_exception
+     */
+    private static function executeQuery(mysqli $db, string $sql): array
+    {
+        // real_query() runs a single statement only, like SQLite3::prepare()
+        $db->real_query($sql);
+
+        $rows = [];
+        $affectedRows = null;
+        $lastInsertRowId = null;
+
+        $res = $db->store_result();
+        if ($res instanceof mysqli_result) {
+            $rows = $res->fetch_all(MYSQLI_ASSOC);
+            $res->free();
+        } else {
+            $affectedRows = max(0, $db->affected_rows);
+            if ($db->insert_id) {
+                $lastInsertRowId = (int)$db->insert_id;
+            }
+        }
+
+        // stored procedures (CALL) return an extra status result, and any
+        // result left unread would break the next query with "out of sync"
+        while ($db->more_results() && $db->next_result()) {
+            $extra = $db->store_result();
+            if ($extra instanceof mysqli_result) {
+                $extra->free();
+            }
+        }
+
+        return [$rows, $affectedRows, $lastInsertRowId];
+    }
+
+    /**
+     * Runs a prepared statement with positional parameters
+     *
+     * @return array{0: array, 1: ?int, 2: ?int} [rows, affected rows, last insert id]
+     * @throws DatabaseException on a parameter count mismatch
+     * @throws mysqli_sql_exception
+     */
+    private static function executeStatement(mysqli $db, string $sql, array $params): array
+    {
+        $stmt = $db->prepare($sql);
+        try {
+            if ($stmt->param_count !== count($params)) {
+                throw new DatabaseException(
+                    "Statement expects {$stmt->param_count} parameters, " . count($params) . ' given'
+                );
+            }
+
+            $types = '';
+            $values = [];
+            foreach ($params as $value) {
+                if (is_bool($value) || is_int($value)) {
+                    $types .= 'i';
+                    $values[] = (int)$value;
+                } elseif (is_float($value)) {
+                    $types .= 'd';
+                    $values[] = $value;
+                } else {
+                    // null binds as NULL whatever the type
+                    $types .= 's';
+                    $values[] = $value;
+                }
+            }
+            $stmt->bind_param($types, ...$values);
+            $stmt->execute();
+
+            $rows = [];
+            $affectedRows = null;
+            $lastInsertRowId = null;
+
+            // the binary protocol already returns native ints and floats
+            $res = $stmt->get_result();
+            if ($res instanceof mysqli_result) {
+                $rows = $res->fetch_all(MYSQLI_ASSOC);
+                $res->free();
+            } else {
+                $affectedRows = max(0, $stmt->affected_rows);
+                if ($stmt->insert_id) {
+                    $lastInsertRowId = (int)$stmt->insert_id;
+                }
+            }
+
+            // see executeQuery()
+            while ($stmt->more_results() && $stmt->next_result()) {
+                $extra = $stmt->get_result();
+                if ($extra instanceof mysqli_result) {
+                    $extra->free();
+                }
+            }
+
+            return [$rows, $affectedRows, $lastInsertRowId];
+        } finally {
+            try {
+                $stmt->close();
+            } catch (Throwable $e) {
+                // the connection is already broken
+            }
         }
     }
 

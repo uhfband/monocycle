@@ -4,6 +4,7 @@ namespace Uhf\Monocycle\Database\SQLite;
 
 use Exception;
 use SQLite3;
+use SQLite3Stmt;
 use Uhf\Monocycle\Database\DatabaseException;
 use Uhf\Monocycle\Database\Driver as IDriver;
 use Uhf\Monocycle\Database\Protocol;
@@ -12,6 +13,8 @@ use Uhf\Monocycle\Monocycle;
 
 class Driver implements IDriver
 {
+    public const RETURNING_NOT_SUPPORTED = 'RETURNING clause is not supported';
+
     private SQLite3 $db;
 
     public function __construct(string $dbPath, ?string $initSqlPath = null)
@@ -58,11 +61,26 @@ class Driver implements IDriver
             return Protocol::errorResponse($queryId, "Field '" . Protocol::FIELD_SQL . "' must be a non-empty string");
         }
 
+        $params = $request[Protocol::FIELD_PARAMS] ?? [];
+        $paramsError = Protocol::paramsError($params);
+        if ($paramsError !== null) {
+            return Protocol::errorResponse($queryId, $paramsError);
+        }
+
+        if (self::usesReturning($sql)) {
+            return Protocol::errorResponse($queryId, self::RETURNING_NOT_SUPPORTED);
+        }
+
         try {
             $totalChangesBefore = $this->db->querySingle('SELECT total_changes()');
             $lastInsertRowIdBefore = $this->db->lastInsertRowID();
 
             $stmt = $this->db->prepare($sql);
+            $bindError = self::bindParams($stmt, $params);
+            if ($bindError !== null) {
+                $stmt->close();
+                return Protocol::errorResponse($queryId, $bindError);
+            }
             $res = $stmt->execute();
 
             $rows = [];
@@ -96,6 +114,53 @@ class Driver implements IDriver
         } catch (ProtocolException $e) {
             return Protocol::errorResponse($queryId, $e->getMessage());
         }
+    }
+
+    /**
+     * @return string|null error description, null when all parameters were bound
+     */
+    private static function bindParams(SQLite3Stmt $stmt, array $params): ?string
+    {
+        $expected = $stmt->paramCount();
+        if (count($params) !== $expected) {
+            return "Statement expects $expected parameters, " . count($params) . ' given';
+        }
+
+        $named = !Protocol::isList($params);
+        foreach ($params as $key => $value) {
+            if ($named) {
+                // SQLite keeps the prefix as part of the name, ':' is the default
+                $name = strpbrk($key[0], ':@$') === false ? ":$key" : $key;
+            } else {
+                $name = $key + 1;
+            }
+
+            if ($value === null) {
+                $ok = $stmt->bindValue($name, null, SQLITE3_NULL);
+            } elseif (is_bool($value) || is_int($value)) {
+                $ok = $stmt->bindValue($name, (int)$value, SQLITE3_INTEGER);
+            } elseif (is_float($value)) {
+                $ok = $stmt->bindValue($name, $value, SQLITE3_FLOAT);
+            } else {
+                $ok = $stmt->bindValue($name, $value, SQLITE3_TEXT);
+            }
+
+            if (!$ok) {
+                return "Unknown parameter $key";
+            }
+        }
+
+        return null;
+    }
+
+    /**
+     * Whether the statement contains the RETURNING keyword. Values are bound as
+     * parameters, so the word can't come from data; a literal, quoted identifier
+     * or comment containing it is rejected too, which is cheaper than parsing SQL.
+     */
+    public static function usesReturning(string $sql): bool
+    {
+        return preg_match('/\bRETURNING\b/i', $sql) === 1;
     }
 
     public function close(): void

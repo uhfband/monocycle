@@ -15,7 +15,12 @@ class ServerClient extends Connection
 
 	private $accepted;
     private $response;
-    private int $maxRequestLength = 4096;
+    private int $maxRequestLength = 0;
+
+    public function setMaxRequestLength(int $maxRequestLength): void
+    {
+        $this->maxRequestLength = $maxRequestLength;
+    }
     private Router $router;
 
     public function setRouter(Router $router)
@@ -75,9 +80,8 @@ class ServerClient extends Connection
     protected function onData(string $data)
     {
         parent::onData($data);
-        $this->readBuffer .= $data;
-        
-        if (strlen($this->readBuffer) > $this->maxRequestLength) {
+
+        if ($this->maxRequestLength && (strlen($this->readBuffer) + strlen($data)) > $this->maxRequestLength) {
             $response = new Response(400, 'Bad Request');
             $response->setContent('Bad request');
             $this->readBuffer  = '';
@@ -85,6 +89,7 @@ class ServerClient extends Connection
 
             return;
         }
+        $this->readBuffer .= $data;
 
         $this->parser->parse($this->readBuffer);
 	}

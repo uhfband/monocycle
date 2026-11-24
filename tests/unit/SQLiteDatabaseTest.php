@@ -78,10 +78,10 @@ class SQLiteDatabaseTest extends BaseTest
     /**
      * Runs one query through the loop and returns [$rows, $error, $returnCode]
      */
-    private function query(string $sql): array
+    private function query(string $sql, array $params = []): array
     {
         $result = null;
-        self::$db->query($sql, function (?array $rows, ?string $error, int $returnCode) use (&$result) {
+        self::$db->query($sql, $params, function (?array $rows, ?string $error, int $returnCode) use (&$result) {
             $result = [$rows, $error, $returnCode];
         });
 
@@ -95,9 +95,9 @@ class SQLiteDatabaseTest extends BaseTest
     /**
      * Runs a query that must succeed and returns its rows
      */
-    private function rows(string $sql): array
+    private function rows(string $sql, array $params = []): array
     {
-        [$rows, $error, $returnCode] = $this->query($sql);
+        [$rows, $error, $returnCode] = $this->query($sql, $params);
         $this->assertNull($error, "Query failed: $sql");
         $this->assertSame(BaseDatabase::RETURN_CODE_SUCCESS, $returnCode);
 
@@ -193,5 +193,55 @@ class SQLiteDatabaseTest extends BaseTest
 
         // the worker keeps serving after a failed query
         $this->assertSame([['x' => 1]], $this->rows('SELECT 1 AS x'));
+    }
+
+    public function testPositionalParams(): void
+    {
+        $this->createUsers();
+
+        // values are bound, not interpolated, so quotes need no escaping
+        $this->assertSame([], $this->rows('INSERT INTO users (name, age) VALUES (?, ?)', ["o'brien", null]));
+        $this->assertSame(
+            [['id' => 4, 'name' => "o'brien", 'age' => null]],
+            $this->rows('SELECT id, name, age FROM users WHERE name = ?', ["o'brien"])
+        );
+        $this->assertSame(
+            [['name' => 'bob'], ['name' => 'alice']],
+            $this->rows('SELECT name FROM users WHERE age BETWEEN ? AND ? ORDER BY age', [20, 35.5])
+        );
+        $this->assertSame([['t' => 1, 'f' => 0]], $this->rows('SELECT ? AS t, ? AS f', [true, false]));
+    }
+
+    public function testNamedParams(): void
+    {
+        $this->createUsers();
+
+        $this->assertSame(
+            [['name' => 'carol']],
+            $this->rows('SELECT name FROM users WHERE age > :min AND name <> :name', ['min' => 30, ':name' => 'x'])
+        );
+    }
+
+    public function testInvalidParams(): void
+    {
+        [$rows, $error, $returnCode] = $this->query('SELECT ? AS x', []);
+        $this->assertNull($rows);
+        $this->assertSame('Statement expects 1 parameters, 0 given', $error);
+        $this->assertSame(BaseDatabase::RETURN_CODE_ERROR, $returnCode);
+
+        [, $error] = $this->query('SELECT :a AS x', ['b' => 1]);
+        $this->assertSame('Unknown parameter b', $error);
+
+        // rejected by the client without a round trip to the worker
+        $called = false;
+        self::$db->query('SELECT ? AS x', [[1]], function (?array $rows, ?string $error, int $returnCode) use (&$called) {
+            $called = true;
+            $this->assertSame('Parameter 1 must be null, bool, int, float or string, array given', $error);
+            $this->assertSame(BaseDatabase::RETURN_CODE_ERROR, $returnCode);
+        });
+        $this->assertTrue($called);
+
+        [, $error] = $this->query('SELECT ? AS x', ["\xff"]);
+        $this->assertSame('Parameter 1 is not a valid UTF-8 string', $error);
     }
 }

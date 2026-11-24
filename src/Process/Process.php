@@ -15,9 +15,9 @@ class Process
     public const STDOUT = 1;
     public const STDERR = 2;
 
-    private const SIGINT = 2;
-    private const SIGKILL = 9;
-    private const SIGTERM = 15;
+    public const SIGINT = 2;
+    public const SIGKILL = 9;
+    public const SIGTERM = 15;
 
     /** @var callable (string $data, int $pipeNum) */
     public $onData;

@@ -79,10 +79,10 @@ class DatabaseServerTest extends BaseTest
     /**
      * Sends one request and returns its decoded response
      */
-    private function query(string $sql): array
+    private function query(string $sql, array $params = []): array
     {
         $queryId = $this->nextQueryId++;
-        $this->client->write(Protocol::request($queryId, $sql));
+        $this->client->write(Protocol::request($queryId, $sql, $params));
 
         $this->pumpUntil(function () use ($queryId) {
             return isset($this->responses[$queryId]);
@@ -94,7 +94,7 @@ class DatabaseServerTest extends BaseTest
     private function insertUsers(): void
     {
         foreach ([['Alice', 30], ['Bob', 25], ['Carol', 41]] as [$name, $age]) {
-            $response = $this->query("INSERT INTO users (name, age) VALUES ('$name', $age)");
+            $response = $this->query('INSERT INTO users (name, age) VALUES (?, ?)', [$name, $age]);
             $this->assertArrayNotHasKey(Protocol::FIELD_ERROR, $response);
         }
     }
@@ -181,6 +181,61 @@ class DatabaseServerTest extends BaseTest
         // the connection keeps working after errors
         $response = $this->query('SELECT COUNT(*) AS cnt FROM users');
         $this->assertSame([['cnt' => 0]], $response[Protocol::FIELD_RESULT]);
+    }
+
+    public function testParams(): void
+    {
+        $response = $this->query('INSERT INTO users (name, age) VALUES (:name, :age)', ['name' => 'Dave', 'age' => 40]);
+        $this->assertSame(1, $response[Protocol::FIELD_AFFECTED_ROWS]);
+
+        $response = $this->query('SELECT name, age FROM users WHERE age = ?', [40]);
+        $this->assertSame([['name' => 'Dave', 'age' => 40]], $response[Protocol::FIELD_RESULT]);
+    }
+
+    public function testInvalidParamsFromRawRequest(): void
+    {
+        $sendRaw = function (array $payload): array {
+            $queryId = $this->nextQueryId++;
+            $this->client->write(Protocol::encode([Protocol::FIELD_QUERY_ID => $queryId] + $payload));
+            $this->pumpUntil(function () use ($queryId) {
+                return isset($this->responses[$queryId]);
+            });
+            return $this->responses[$queryId];
+        };
+
+        $response = $sendRaw([Protocol::FIELD_SQL => 'SELECT ? AS x', Protocol::FIELD_PARAMS => 'oops']);
+        $this->assertSame("Field 'params' must be an array or an object", $response[Protocol::FIELD_ERROR]);
+
+        $response = $sendRaw([Protocol::FIELD_SQL => 'SELECT ? AS x', Protocol::FIELD_PARAMS => [['nested']]]);
+        $this->assertSame('Parameter 1 must be null, bool, int, float or string, array given', $response[Protocol::FIELD_ERROR]);
+
+        // a request without params is a statement without placeholders
+        $response = $sendRaw([Protocol::FIELD_SQL => 'SELECT 1 AS x']);
+        $this->assertSame([['x' => 1]], $response[Protocol::FIELD_RESULT]);
+    }
+
+    public function testReturningIsRejected(): void
+    {
+        $this->insertUsers();
+
+        foreach ([
+            "INSERT INTO users (name, age) VALUES ('Dave', 40) RETURNING id",
+            "UPDATE users SET age = age + 1 returning *",
+            "DELETE FROM users\nReturning name",
+        ] as $sql) {
+            $response = $this->query($sql);
+            $this->assertSame(Driver::RETURNING_NOT_SUPPORTED, $response[Protocol::FIELD_ERROR] ?? null, $sql);
+        }
+
+        // nothing was executed
+        $response = $this->query('SELECT COUNT(*) AS cnt, SUM(age) AS ages FROM users');
+        $before = $response[Protocol::FIELD_RESULT];
+        $this->query("UPDATE users SET age = age + 1 RETURNING id");
+        $this->assertSame($before, $this->query('SELECT COUNT(*) AS cnt, SUM(age) AS ages FROM users')[Protocol::FIELD_RESULT]);
+
+        // a longer identifier is not the keyword
+        $response = $this->query('SELECT 1 AS returning_count');
+        $this->assertSame([['returning_count' => 1]], $response[Protocol::FIELD_RESULT]);
     }
 
     public function testCloseRemovesSocketFile(): void

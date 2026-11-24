@@ -12,6 +12,10 @@ use Uhf\Monocycle\Timer\Timer;
  * Asynchronous client of a database worker process (bin/db_worker_*).
  * Use the engine-specific subclasses' open() to start a worker and get a client for it.
  *
+ * A query is a statement with placeholders plus its parameters, sent to the
+ * worker separately and bound there, so values never need escaping: positional
+ * (`?`, a list of values) or, for SQLite only, named (`:name`, a map of values).
+ *
  * Queries are sent over the worker's unix socket using the Protocol packet
  * format and answered out of band: the callback passed to query() is called
  * from the event loop once the response arrives, the query times out, or the
@@ -30,7 +34,7 @@ abstract class Database
 
     private int $id = 1;
 
-    /** @var array<int, array{0: string, 1: callable, 2: int}> pending queries: [sql, callback, deadline] */
+    /** @var array<int, array{0: string, 1: array, 2: callable, 3: int}> pending queries: [sql, params, callback, deadline] */
     private array $queries = [];
 
     /** @var array<int, true> ids of pending queries already written to the worker */
@@ -108,12 +112,14 @@ abstract class Database
     }
 
     /**
-     * @param string $query
+     * @param string $statement SQL with `?` (or, SQLite only, `:name`) placeholders
+     * @param array $params values bound to the placeholders: a list for positional,
+     *                      a map for named ones; null, bool, int, float or UTF-8 string
      * @param callable $callback function (?array $rows, ?string $error, int $returnCode)
      * @param int|null $timeout seconds, defaults to the database timeout
      * @return int query id
      */
-    public function query(string $query, $callback, ?int $timeout = null): int
+    public function query(string $statement, array $params, callable $callback, ?int $timeout = null): int
     {
         $id = $this->id++;
 
@@ -122,7 +128,13 @@ abstract class Database
             return $id;
         }
 
-        $this->queries[$id] = [$query, $callback, time() + ($timeout ?? $this->timeout)];
+        $error = Protocol::paramsError($params);
+        if ($error !== null) {
+            call_user_func($callback, null, $error, self::RETURN_CODE_ERROR);
+            return $id;
+        }
+
+        $this->queries[$id] = [$statement, $params, $callback, time() + ($timeout ?? $this->timeout)];
 
         if ($this->connected) {
             $this->send($id);
@@ -207,7 +219,7 @@ abstract class Database
             return;
         }
         $this->sent[$id] = true;
-        $this->client->write(Protocol::request($id, $this->queries[$id][0]));
+        $this->client->write(Protocol::request($id, $this->queries[$id][0], $this->queries[$id][1]));
     }
 
     protected function onData(string $data): void
@@ -284,7 +296,7 @@ abstract class Database
     private function expireQueries(): void
     {
         $now = time();
-        foreach ($this->queries as $id => [, , $deadline]) {
+        foreach ($this->queries as $id => [, , , $deadline]) {
             if ($deadline <= $now) {
                 $this->complete($id, null, 'Query timed out', self::RETURN_CODE_TIMEOUT);
             }
@@ -303,7 +315,7 @@ abstract class Database
         if (!isset($this->queries[$id])) {
             return;
         }
-        $callback = $this->queries[$id][1];
+        $callback = $this->queries[$id][2];
         unset($this->queries[$id], $this->sent[$id]);
 
         if ($returnCode === null) {
