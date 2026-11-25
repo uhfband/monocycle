@@ -37,12 +37,15 @@ class Client extends BaseSocketClient
     private string $clientId;
     private int $keepAlive;
     private bool $cleanSession;
+    private ?string $username;
+    private ?string $password;
     private int $packetId = 0;
+    private bool $mqttConnected = false;
 
     private string $readBuffer = '';
     private int $lastActivity;
 
-    private ?Timer $keepAliveTimer;
+    private ?Timer $keepAliveTimer = null;
 
     public function __construct(
         string $url,
@@ -52,7 +55,9 @@ class Client extends BaseSocketClient
         ?int $timeout = null,
         ?string $localCert = null,
         ?string $localKey = null,
-        ?string $cafile = null
+        ?string $cafile = null,
+        ?string $username = null,
+        ?string $password = null
     ) {
         $cryptoMethod = null;
         $sslOptions = null;
@@ -94,6 +99,13 @@ class Client extends BaseSocketClient
         $this->clientId = $clientId;
         $this->keepAlive = $keepAlive;
         $this->cleanSession = $cleanSession;
+        // explicit arguments win over credentials in the URL (mqtt://user:pass@host:port)
+        $this->username = $username ?? (isset($parsedUrl['user']) ? rawurldecode($parsedUrl['user']) : null);
+        $this->password = $password ?? (isset($parsedUrl['pass']) ? rawurldecode($parsedUrl['pass']) : null);
+        // MQTT 3.1.1: a password requires a username
+        if ($this->password !== null && $this->username === null) {
+            throw new \InvalidArgumentException('MQTT password requires a username');
+        }
         $this->lastActivity = time();
     }
 
@@ -168,7 +180,8 @@ class Client extends BaseSocketClient
         $packetId = $this->nextPacketId();
         $variableHeader = chr($packetId >> 8) . chr($packetId & 0xFF);
 
-        $this->sendPacket(self::PACKET_TYPE_SUBSCRIBE, $variableHeader, $payload);
+        // MQTT 3.1.1 requires the reserved flags 0b0010 on SUBSCRIBE
+        $this->sendPacket(self::PACKET_TYPE_SUBSCRIBE, $variableHeader, $payload, 0x02);
     }
 
     public function publish(string $topic, string $payload, int $qos = 0, bool $retain = false): void
@@ -195,13 +208,15 @@ class Client extends BaseSocketClient
 
     public function close(bool $graceful = true): void
     {
-        if ($this->isClosed()) {
+        if ($this->getState() === self::STATE_CLOSED) {
             return;
         }
-        $this->sendPacket(self::PACKET_TYPE_DISCONNECT);
-        if (!empty($this->keepAliveTimer)) {
-            $this->keepAliveTimer->stop();
+        // DISCONNECT only makes sense on an established MQTT session that can still be written to
+        if ($graceful && $this->mqttConnected && $this->getState() === self::STATE_CONNECTED) {
+            $this->sendPacket(self::PACKET_TYPE_DISCONNECT);
         }
+        $this->mqttConnected = false;
+        $this->stopKeepAliveTimer();
         parent::close($graceful);
     }
 
@@ -257,6 +272,8 @@ class Client extends BaseSocketClient
     protected function onMqttConnect(): void
     {
         Monocycle::getLogger()->notice("MQTT connected", ['class' => __CLASS__, 'method' => __METHOD__]);
+        $this->mqttConnected = true;
+        $this->stopKeepAliveTimer();
         $this->keepAliveTimer = new Timer(
             function () {
                 $this->ping();
@@ -267,14 +284,23 @@ class Client extends BaseSocketClient
 
     protected function onClose(): void
     {
-        $this->keepAliveTimer = null;
+        $this->mqttConnected = false;
+        $this->stopKeepAliveTimer();
         parent::onClose();
     }
 
-    private function sendPacket($type, $varHeader = null, $payload = null, int $flags = 0): void
+    private function stopKeepAliveTimer(): void
+    {
+        if ($this->keepAliveTimer !== null) {
+            $this->keepAliveTimer->stop();
+            $this->keepAliveTimer = null;
+        }
+    }
+
+    private function sendPacket(int $type, string $varHeader = '', string $payload = '', int $flags = 0): void
     {
         $fixedHeader = chr($type << 4 | $flags);
-        $packet = $fixedHeader . chr(strlen($varHeader) + strlen($payload)) . $varHeader . $payload;
+        $packet = $fixedHeader . $this->encodeLength(strlen($varHeader) + strlen($payload)) . $varHeader . $payload;
         Monocycle::getLogger()->debug(">>> " . bin2hex($packet));
         // no keepAliveTimer restart here: pings must keep going while publishing,
         // their PINGRESP is the only inbound traffic a publish-only client gets
@@ -290,6 +316,12 @@ class Client extends BaseSocketClient
         if ($this->cleanSession) {
             $connectFlags |= 0x02;
         }
+        if ($this->username !== null) {
+            $connectFlags |= 0x80;
+        }
+        if ($this->password !== null) {
+            $connectFlags |= 0x40;
+        }
 
         $variableHeader =
             $protocolName .
@@ -298,7 +330,14 @@ class Client extends BaseSocketClient
             chr($this->keepAlive >> 8) .
             chr($this->keepAlive & 0xFF);
 
+        // payload order is fixed: client id, (will topic/message), username, password
         $payload = $this->encodeString($this->clientId);
+        if ($this->username !== null) {
+            $payload .= $this->encodeString($this->username);
+        }
+        if ($this->password !== null) {
+            $payload .= $this->encodeString($this->password);
+        }
 
         $this->sendPacket(self::PACKET_TYPE_CONNECT, $variableHeader, $payload);
     }

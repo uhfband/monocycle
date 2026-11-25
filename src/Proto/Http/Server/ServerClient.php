@@ -79,6 +79,9 @@ class ServerClient extends Connection
 
     protected function onData(string $data)
     {
+        if ($this->closing) {
+            return;
+        }
         parent::onData($data);
 
         if ($this->maxRequestLength && (strlen($this->readBuffer) + strlen($data)) > $this->maxRequestLength) {
