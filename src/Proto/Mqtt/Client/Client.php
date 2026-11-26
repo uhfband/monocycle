@@ -32,6 +32,9 @@ class Client extends BaseSocketClient
     public const CMD_DISCONNECT   = 0xE0; // self::PACKET_TYPE_DISCONNECT << 4
 
     /** @var callable */
+    public $onMqttConnect;
+
+    /** @var callable */
     public $onMessage;
 
     private string $address;
@@ -67,6 +70,9 @@ class Client extends BaseSocketClient
 
         $parsedUrl = parse_url($url);
         switch ($parsedUrl['scheme']) {
+            case 'tls':
+                $cryptoMethod = STREAM_CRYPTO_METHOD_TLS_CLIENT;
+                break;
             case 'tlsv1.0':
                 $cryptoMethod = STREAM_CRYPTO_METHOD_TLSv1_0_CLIENT;
                 break;
@@ -76,11 +82,14 @@ class Client extends BaseSocketClient
             case 'tlsv1.2':
                 $cryptoMethod = STREAM_CRYPTO_METHOD_TLSv1_2_CLIENT;
                 break;
+            case 'tlsv1.3':
+                $cryptoMethod = STREAM_CRYPTO_METHOD_TLSv1_3_CLIENT;
+                break;
         }
         if ($cryptoMethod) {
             $sslOptions = [
                 'verify_peer'       => true,
-                'verify_peer_name'  => false,
+                'verify_peer_name'  => true,
                 'allow_self_signed' => false,
 
                 'local_cert'  => null,
@@ -336,6 +345,9 @@ class Client extends BaseSocketClient
     {
         Monocycle::getLogger()->notice("MQTT connected", ['class' => __CLASS__, 'method' => __METHOD__]);
         $this->mqttConnected = true;
+        if (is_callable($this->onMqttConnect)) {
+            call_user_func($this->onMqttConnect, $this);
+        }
         foreach ($this->pendingPackets as $packet) {
             $this->write($packet);
         }
