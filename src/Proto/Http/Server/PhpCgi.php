@@ -145,6 +145,7 @@ class PhpCgi
             // php-cgi refuses to run without it (cgi.force_redirect)
             'REDIRECT_STATUS' => '200',
             'PATH' => (string)getenv('PATH'),
+            'LD_LIBRARY_PATH' => (string)getenv('LD_LIBRARY_PATH'),
         ];
 
         if (strlen($body = $request->getContent())) {

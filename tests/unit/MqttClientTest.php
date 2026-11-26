@@ -32,7 +32,7 @@ class MqttClientTest extends BaseTest
 
     public function testConnectPacketCarriesCredentials(): void
     {
-        $client = new Client('mqtt://127.0.0.1:1', 'cid', 30, true, null, null, null, null, 'user', 'secret');
+        $client = (new Client('mqtt://127.0.0.1:1', 'cid'))->setUsername('user')->setPassword('secret');
         $client->connect('tcp://' . $this->broker->getLocalAddress());
 
         $packet = $this->readPacket();
@@ -51,10 +51,19 @@ class MqttClientTest extends BaseTest
         $this->assertStringEndsWith("\0\3cid\0\5us@er\0\4p:ss", $this->readPacket());
     }
 
+    public function testSettersOverrideUrlCredentials(): void
+    {
+        $client = (new Client('mqtt://a:b@127.0.0.1:1', 'cid'))->setUsername('user')->setPassword('secret');
+        $client->connect('tcp://' . $this->broker->getLocalAddress());
+
+        $this->assertStringEndsWith("\0\3cid\0\4user\0\6secret", $this->readPacket());
+    }
+
     public function testPasswordWithoutUsernameIsRejected(): void
     {
+        $client = (new Client('mqtt://127.0.0.1:1', 'cid'))->setPassword('secret');
         $this->expectException(InvalidArgumentException::class);
-        new Client('mqtt://127.0.0.1:1', 'cid', 30, true, null, null, null, null, null, 'secret');
+        $client->connect('tcp://' . $this->broker->getLocalAddress());
     }
 
     public function testLongPublishUsesMultiByteLength(): void
@@ -81,9 +90,60 @@ class MqttClientTest extends BaseTest
         $this->assertSame(0x82, ord($this->readPacket()[0]));
     }
 
+    public function testPacketsWrittenBeforeConnAckFollowConnect(): void
+    {
+        $client = new Client('mqtt://127.0.0.1:1', 'cid');
+        $client->connect('tcp://' . $this->broker->getLocalAddress());
+        $client->subscribe(['a/b']);
+
+        $this->assertSame(0x10, ord($this->readPacket()[0]), 'CONNECT goes first');
+        $this->pump(0.1);
+        $this->assertSame('', $this->received, 'nothing else before CONNACK');
+
+        $this->brokerConn->write("\x20\x02\x00\x00");
+        $this->assertSame(0x82, ord($this->readPacket()[0]));
+    }
+
+    public function testQos1PayloadExcludesPacketIdAndIsAcked(): void
+    {
+        $messages = [];
+        $client = $this->connectedClient();
+        $client->onMessage = function (Client $client, string $topic, string $payload) use (&$messages) {
+            $messages[] = [$topic, $payload];
+        };
+        $this->received = '';
+
+        $this->brokerConn->write("\x32\x08\x00\x01t\x12\x34abc"); // PUBLISH QoS 1, id 0x1234
+        $this->assertSame("\x40\x02\x12\x34", $this->readPacket(), 'PUBACK');
+        $this->assertSame([['t', 'abc']], $messages);
+    }
+
+    public function testQos2Handshake(): void
+    {
+        $messages = [];
+        $client = $this->connectedClient();
+        $client->onMessage = function (Client $client, string $topic, string $payload) use (&$messages) {
+            $messages[] = $payload;
+        };
+        $this->received = '';
+
+        // inbound: PUBLISH QoS 2 -> PUBREC, PUBREL -> PUBCOMP
+        $this->brokerConn->write("\x34\x08\x00\x01t\x00\x07abc");
+        $this->assertSame("\x50\x02\x00\x07", $this->readPacket(), 'PUBREC');
+        $this->assertSame(['abc'], $messages);
+        $this->brokerConn->write("\x62\x02\x00\x07");
+        $this->assertSame("\x70\x02\x00\x07", $this->readPacket(), 'PUBCOMP');
+
+        // outbound: PUBLISH QoS 2, PUBREC -> PUBREL
+        $client->publish('t', 'x', 2);
+        $this->assertSame("\x34\x06\x00\x01t\x00\x01x", $this->readPacket());
+        $this->brokerConn->write("\x50\x02\x00\x01");
+        $this->assertSame("\x62\x02\x00\x01", $this->readPacket(), 'PUBREL');
+    }
+
     public function testRejectedConnAckClosesWithoutError(): void
     {
-        $client = new Client('mqtt://127.0.0.1:1', 'cid', 30, true, null, null, null, null, 'user', 'wrong');
+        $client = (new Client('mqtt://127.0.0.1:1', 'cid'))->setUsername('user')->setPassword('wrong');
         $client->connect('tcp://' . $this->broker->getLocalAddress());
         $this->readPacket();
 
@@ -133,6 +193,14 @@ class MqttClientTest extends BaseTest
         });
 
         return $client;
+    }
+
+    private function pump(float $seconds): void
+    {
+        $deadline = microtime(true) + $seconds;
+        while (microtime(true) < $deadline) {
+            $this->tick(0.02);
+        }
     }
 
     /**

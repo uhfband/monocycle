@@ -1,0 +1,32 @@
+#!/usr/bin/env php
+<?php
+
+use Monolog\Logger;
+use Uhf\Monocycle\Monocycle;
+use Uhf\Monocycle\Proto\Mqtt\Server\Server as MqttServer;
+
+// $_composer_autoload_path is only set when run via Composer's vendor/bin proxy;
+// it can also be run directly (e.g. ./bin/mqtt_server from a checkout), so probe both the
+// standalone checkout and the installed-as-dependency (vendor/uhf/monocycle) layouts
+include $_composer_autoload_path ?? (function (): string {
+    foreach ([__DIR__ . '/../vendor/autoload.php', __DIR__ . '/../../../autoload.php'] as $file) {
+        if (is_file($file)) {
+            return $file;
+        }
+    }
+    fwrite(STDERR, "Composer autoloader not found\n");
+    exit(1);
+})();
+
+set_time_limit(0);
+ini_set('display_errors', 1);
+
+$port = getenv('MQTT_PORT') ?: 1883;
+$host = getenv('MQTT_HOST') ?: '0.0.0.0';
+if (getenv('MQTT_VERBOSE')) {
+    Monocycle::setLogLevel(Logger::NOTICE);
+}
+
+$server = new MqttServer(sprintf("tcp://%s:%d", $host, $port));
+
+Monocycle::run();

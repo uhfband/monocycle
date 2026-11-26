@@ -3,6 +3,8 @@
 namespace Uhf\Monocycle\Proto\Mqtt\Client;
 
 use Uhf\Monocycle\Monocycle;
+use Uhf\Monocycle\Proto\Mqtt\Packet;
+use Uhf\Monocycle\Proto\Mqtt\ProtocolException;
 use Uhf\Monocycle\Socket\Connection as BaseSocketClient;
 use Uhf\Monocycle\Timer\Timer;
 
@@ -14,6 +16,8 @@ class Client extends BaseSocketClient
     public const PACKET_TYPE_PUBLISH    = 3;
     public const PACKET_TYPE_PUBACK     = 4;
     public const PACKET_TYPE_PUBREC     = 5;
+    public const PACKET_TYPE_PUBREL     = 6;
+    public const PACKET_TYPE_PUBCOMP    = 7;
 
     public const PACKET_TYPE_SUBSCRIBE  = 8;
     public const PACKET_TYPE_SUBACK     = 9;
@@ -39,8 +43,12 @@ class Client extends BaseSocketClient
     private bool $cleanSession;
     private ?string $username;
     private ?string $password;
+    /** @var array{topic:string,message:string,qos:int,retain:bool}|null */
+    private ?array $will = null;
     private int $packetId = 0;
     private bool $mqttConnected = false;
+    /** @var string[] packets written before CONNACK, sent once the session is up */
+    private array $pendingPackets = [];
 
     private string $readBuffer = '';
     private int $lastActivity;
@@ -52,12 +60,7 @@ class Client extends BaseSocketClient
         string $clientId,
         int $keepAlive = 30,
         bool $cleanSession = true,
-        ?int $timeout = null,
-        ?string $localCert = null,
-        ?string $localKey = null,
-        ?string $cafile = null,
-        ?string $username = null,
-        ?string $password = null
+        ?int $timeout = null
     ) {
         $cryptoMethod = null;
         $sslOptions = null;
@@ -80,10 +83,10 @@ class Client extends BaseSocketClient
                 'verify_peer_name'  => false,
                 'allow_self_signed' => false,
 
-                'local_cert'  => $localCert,
-                'local_pk'    => $localKey,
+                'local_cert'  => null,
+                'local_pk'    => null,
 
-                'cafile' => $cafile,
+                'cafile' => null,
             ];
         }
 
@@ -99,14 +102,88 @@ class Client extends BaseSocketClient
         $this->clientId = $clientId;
         $this->keepAlive = $keepAlive;
         $this->cleanSession = $cleanSession;
-        // explicit arguments win over credentials in the URL (mqtt://user:pass@host:port)
-        $this->username = $username ?? (isset($parsedUrl['user']) ? rawurldecode($parsedUrl['user']) : null);
-        $this->password = $password ?? (isset($parsedUrl['pass']) ? rawurldecode($parsedUrl['pass']) : null);
-        // MQTT 3.1.1: a password requires a username
-        if ($this->password !== null && $this->username === null) {
-            throw new \InvalidArgumentException('MQTT password requires a username');
-        }
+        // credentials from the URL (mqtt://user:pass@host:port); setUsername()/setPassword() override them
+        $this->username = isset($parsedUrl['user']) ? rawurldecode($parsedUrl['user']) : null;
+        $this->password = isset($parsedUrl['pass']) ? rawurldecode($parsedUrl['pass']) : null;
+        $this->checkCredentials();
         $this->lastActivity = time();
+    }
+
+    public function setUsername(string $username): self
+    {
+        $this->username = $username;
+
+        return $this;
+    }
+
+    public function setPassword(string $password): self
+    {
+        $this->password = $password;
+
+        return $this;
+    }
+
+    /**
+     * True once the broker has accepted CONNECT (CONNACK), until the connection closes
+     */
+    public function isMqttConnected(): bool
+    {
+        return $this->mqttConnected;
+    }
+
+    /**
+     * Last Will: published by the broker when this client goes away without sending DISCONNECT
+     */
+    public function setWill(string $topic, string $message, int $qos = 0, bool $retain = false): self
+    {
+        if ($qos < 0 || $qos > 2) {
+            throw new \InvalidArgumentException('QoS must be 0, 1 or 2');
+        }
+        $this->will = ['topic' => $topic, 'message' => $message, 'qos' => $qos, 'retain' => $retain];
+
+        return $this;
+    }
+
+    public function setTlsVerifyPeer(bool $verifyPeer): self
+    {
+        $this->sslOptions['verify_peer'] = $verifyPeer;
+
+        return $this;
+    }
+
+    public function setTlsVerifyPeerName(bool $verifyPeerName): self
+    {
+        $this->sslOptions['verify_peer_name'] = $verifyPeerName;
+
+        return $this;
+    }
+
+    public function setTlsSelfSignedAllowed(bool $selfSigned): self
+    {
+        $this->sslOptions['allow_self_signed'] = $selfSigned;
+
+        return $this;
+    }
+
+    public function setTlsCertificateAuthorityFile(string $cafile): self
+    {
+        $this->sslOptions['cafile'] = $cafile;
+
+        return $this;
+    }
+
+    public function setTlsClientCertificateFile(string $clientCert): self
+    {
+        $this->sslOptions['local_cert'] = $clientCert;
+
+        return $this;
+    }
+
+    public function setTlsClientCertificateKeyFile(string $clientCertKey): self
+    {
+        $this->sslOptions['local_pk'] = $clientCertKey;
+
+        return $this;
     }
 
     /**
@@ -114,6 +191,8 @@ class Client extends BaseSocketClient
      */
     public function connect(?string $remoteAddress = null, ?int $cryptoMethod = null, ?array $sslOptions = null)
     {
+        $this->checkCredentials();
+
         return parent::connect(
             $remoteAddress ?? $this->address,
             $cryptoMethod ?? $this->cryptoMethod,
@@ -216,6 +295,7 @@ class Client extends BaseSocketClient
             $this->sendPacket(self::PACKET_TYPE_DISCONNECT);
         }
         $this->mqttConnected = false;
+        $this->pendingPackets = [];
         $this->stopKeepAliveTimer();
         parent::close($graceful);
     }
@@ -229,30 +309,13 @@ class Client extends BaseSocketClient
         Monocycle::getLogger()
             ->debug('<<< ' . bin2hex($this->readBuffer));
 
-        while (true) {
-            if (strlen($this->readBuffer) < 2) {
-                return;
+        try {
+            while (($packet = Packet::extract($this->readBuffer)) !== null) {
+                $this->handlePacket($packet[0], $packet[1]);
             }
-
-            $data = $this->readBuffer;
-            $byte1 = ord($data[0]);
-
-            [$remainingLength, $lengthBytes] = $this->decodeLength(substr($data, 1));
-            if ($remainingLength === null) {
-                // Not enough data to determine remaining length yet.
-                return;
-            }
-
-            $totalLength = 1 + $lengthBytes + $remainingLength;
-            if (strlen($data) < $totalLength) {
-                // Wait for the rest of the packet.
-                return;
-            }
-
-            $packet = substr($data, 0, $totalLength);
-            $this->readBuffer = substr($data, $totalLength);
-
-            $this->handlePacket($packet, $byte1);
+        } catch (ProtocolException $e) {
+            Monocycle::getLogger()->error(sprintf('[%s] %s', __CLASS__, $e->getMessage()));
+            $this->close(false);
         }
     }
 
@@ -273,6 +336,10 @@ class Client extends BaseSocketClient
     {
         Monocycle::getLogger()->notice("MQTT connected", ['class' => __CLASS__, 'method' => __METHOD__]);
         $this->mqttConnected = true;
+        foreach ($this->pendingPackets as $packet) {
+            $this->write($packet);
+        }
+        $this->pendingPackets = [];
         $this->stopKeepAliveTimer();
         $this->keepAliveTimer = new Timer(
             function () {
@@ -285,8 +352,19 @@ class Client extends BaseSocketClient
     protected function onClose(): void
     {
         $this->mqttConnected = false;
+        $this->pendingPackets = [];
         $this->stopKeepAliveTimer();
         parent::onClose();
+    }
+
+    /**
+     * MQTT 3.1.1: a password requires a username
+     */
+    private function checkCredentials(): void
+    {
+        if ($this->password !== null && $this->username === null) {
+            throw new \InvalidArgumentException('MQTT password requires a username');
+        }
     }
 
     private function stopKeepAliveTimer(): void
@@ -299,11 +377,16 @@ class Client extends BaseSocketClient
 
     private function sendPacket(int $type, string $varHeader = '', string $payload = '', int $flags = 0): void
     {
-        $fixedHeader = chr($type << 4 | $flags);
-        $packet = $fixedHeader . $this->encodeLength(strlen($varHeader) + strlen($payload)) . $varHeader . $payload;
+        $packet = Packet::encode($type, $varHeader, $payload, $flags);
         Monocycle::getLogger()->debug(">>> " . bin2hex($packet));
         // no keepAliveTimer restart here: pings must keep going while publishing,
         // their PINGRESP is the only inbound traffic a publish-only client gets
+        if (!$this->mqttConnected && $type !== self::PACKET_TYPE_CONNECT) {
+            // CONNECT must be the first packet, so hold back whatever is written while connecting
+            $this->pendingPackets[] = $packet;
+
+            return;
+        }
         $this->write($packet);
     }
 
@@ -322,6 +405,9 @@ class Client extends BaseSocketClient
         if ($this->password !== null) {
             $connectFlags |= 0x40;
         }
+        if ($this->will !== null) {
+            $connectFlags |= 0x04 | ($this->will['qos'] << 3) | ($this->will['retain'] ? 0x20 : 0);
+        }
 
         $variableHeader =
             $protocolName .
@@ -332,6 +418,9 @@ class Client extends BaseSocketClient
 
         // payload order is fixed: client id, (will topic/message), username, password
         $payload = $this->encodeString($this->clientId);
+        if ($this->will !== null) {
+            $payload .= $this->encodeString($this->will['topic']) . $this->encodeString($this->will['message']);
+        }
         if ($this->username !== null) {
             $payload .= $this->encodeString($this->username);
         }
@@ -342,48 +431,45 @@ class Client extends BaseSocketClient
         $this->sendPacket(self::PACKET_TYPE_CONNECT, $variableHeader, $payload);
     }
 
-    private function handlePacket(string $packet, int $byte1): void
+    /**
+     * @param int    $byte1 packet type and flags
+     * @param string $body  the packet after the fixed header
+     * @throws ProtocolException
+     */
+    private function handlePacket(int $byte1, string $body): void
     {
-        $type = ($byte1 & 0xF0) >> 4;
-
-        switch ($type) {
-            case self::PACKET_TYPE_CONNACK: // CONNACK
-                $this->handleConnAck($packet);
+        switch ($byte1 >> 4) {
+            case Packet::CONNACK:
+                $this->handleConnAck($body);
                 break;
 
-            case self::PACKET_TYPE_PUBLISH: // PUBLISH
-                $this->handlePublish($packet, $byte1);
+            case Packet::PUBLISH:
+                $this->handlePublish($byte1, $body);
                 break;
 
-            case self::PACKET_TYPE_SUBACK: // SUBACK
-                // For now we just ignore the contents.
+            case Packet::PUBREC:
+                // QoS 2 publish, step 2: the broker only delivers the message once it gets PUBREL
+                // (MQTT 3.1.1 requires the reserved flags 0b0010 on PUBREL)
+                $this->sendPacket(Packet::PUBREL, substr($body, 0, 2), '', 0x02);
                 break;
 
-            case self::PACKET_TYPE_PINGRESP: // PINGRESP
-                // nothing to do
+            case Packet::PUBREL:
+                // QoS 2 delivery, step 3: complete the exchange started by our PUBREC
+                $this->sendPacket(Packet::PUBCOMP, substr($body, 0, 2));
                 break;
 
             default:
-                // ignore other packet types
+                // SUBACK, UNSUBACK, PUBACK, PUBCOMP, PINGRESP: nothing to do
                 break;
         }
     }
 
-    private function handleConnAck(string $packet): void
+    private function handleConnAck(string $body): void
     {
-        $offset = 1;
-        [$remainingLength, $lengthBytes] = $this->decodeLength(substr($packet, $offset));
-        if ($remainingLength === null) {
-            return;
+        if (strlen($body) < 2) {
+            throw new ProtocolException('Truncated CONNACK');
         }
-        $offset += $lengthBytes;
-
-        if ($remainingLength < 2 || strlen($packet) < $offset + 2) {
-            return;
-        }
-
-        $sessionPresent = (ord($packet[$offset]) & 0x01) !== 0;
-        $code = ord($packet[$offset + 1]);
+        $code = ord($body[1]);
 
         if ($code === 0) {
             $this->onMqttConnect();
@@ -393,115 +479,32 @@ class Client extends BaseSocketClient
         }
     }
 
-    private function handlePublish(string $packet, int $byte1): void
+    private function handlePublish(int $byte1, string $body): void
     {
-        $flags = $byte1 & 0x0F;
-        $qos = ($flags & 0x06) >> 1;
-
-        $offset = 1;
-        [$remainingLength, $lengthBytes] = $this->decodeLength(substr($packet, $offset));
-        if ($remainingLength === null) {
-            return;
-        }
-        $offset += $lengthBytes;
-
-        if ($remainingLength <= 0) {
-            return;
-        }
-
-        if (strlen($packet) < $offset + 2) {
-            return;
-        }
-
-        $topicLength = (ord($packet[$offset]) << 8) + ord($packet[$offset + 1]);
-        $offset += 2;
-
-        if (strlen($packet) < $offset + $topicLength) {
-            return;
-        }
-
-        $topic = substr($packet, $offset, $topicLength);
-        $offset += $topicLength;
-        $variableHeader = '';
+        $qos = ($byte1 & 0x06) >> 1;
+        $offset = 0;
+        $topic = Packet::readString($body, $offset);
 
         switch ($qos) {
             case 0:
-                //nothing
                 break;
             case 1:
-                $packetId = (ord($packet[$offset]) << 8) + ord($packet[$offset + 1]);
-                $variableHeader .= chr($packetId >> 8) . chr($packetId & 0xFF);
-                $this->sendPacket(self::PACKET_TYPE_PUBACK, $variableHeader);
-                break;
             case 2:
-                $packetId = (ord($packet[$offset]) << 8) + ord($packet[$offset + 1]);
-                $variableHeader .= chr($packetId >> 8) . chr($packetId & 0xFF);
-                $this->sendPacket(self::PACKET_TYPE_PUBREC, $variableHeader);
+                // the packet id follows the topic and is not part of the payload
+                $packetId = substr($body, $offset, 2);
+                Packet::readUint16($body, $offset);
+                $this->sendPacket($qos === 1 ? Packet::PUBACK : Packet::PUBREC, $packetId);
                 break;
-
             default:
-                Monocycle::getLogger()
-                    ->error("QOS value error: $qos", ['file' => __FILE__, 'line' => __LINE__]);
-                return;
+                throw new ProtocolException("Invalid QoS $qos");
         }
 
-        $payload = substr($packet, $offset);
-        
-        $this->onMessage($topic, $payload);
+        $this->onMessage($topic, (string)substr($body, $offset));
     }
 
     private function encodeString(string $value): string
     {
-        $length = strlen($value);
-
-        return chr($length >> 8) . chr($length & 0xFF) . $value;
-    }
-
-    private function encodeLength(int $length): string
-    {
-        $encoded = '';
-
-        do {
-            $digit = $length % 128;
-            $length = intdiv($length, 128);
-            if ($length > 0) {
-                $digit |= 0x80;
-            }
-            $encoded .= chr($digit);
-        } while ($length > 0);
-
-        return $encoded;
-    }
-
-    /**
-     * @return array{0:int|null,1:int}
-     */
-    private function decodeLength(string $data): array
-    {
-        $multiplier = 1;
-        $value = 0;
-        $i = 0;
-
-        while (true) {
-            if (!isset($data[$i])) {
-                return [null, 0];
-            }
-            $encodedByte = ord($data[$i]);
-            $value += ($encodedByte & 0x7F) * $multiplier;
-            $multiplier *= 128;
-            $i++;
-
-            if (($encodedByte & 0x80) === 0) {
-                break;
-            }
-
-            if ($i > 4) {
-                // Malformed Remaining Length
-                return [null, 0];
-            }
-        }
-
-        return [$value, $i];
+        return Packet::encodeString($value);
     }
 
     private function nextPacketId(): int

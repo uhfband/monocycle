@@ -23,6 +23,7 @@
     },
     "bin": [
         "bin/http_server",
+        "bin/mqtt_server",
         "bin/db_worker_sqlite",
         "bin/db_worker_mysql"
     ],
